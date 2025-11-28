@@ -1,0 +1,417 @@
+"""
+DashcamToGPX — OCR-only (integrated, live single-point map)
+- Saves GPX to: ~/Desktop/OCR/<basename>_extracted.gpx
+- ROI set to fit Garmin dashcam (lower 10% ver // 32 to 54% hor).
+"""
+
+import os, re, time, threading, cv2, numpy as np
+from datetime import datetime, timedelta
+from tkinter import Tk, Frame, Label, Button, Entry, StringVar, ttk, scrolledtext, filedialog, messagebox
+from PIL import Image, ImageTk
+import pytesseract
+from staticmap import StaticMap, CircleMarker
+
+# ---------------- CONFIG ----------------
+VERSION = "v30-ocr-live"
+ROI_DEFAULT = (0.32, 0.54, 0.90, 1.00)  # left_frac, right_frac, top_frac, bottom_frac
+TESS_CONFIG_BASE = r'-c tessedit_char_whitelist=0123456789NnSsEeWw°.,-'
+TESS_PSMS = [7, 6]  # try single-line (7) then sparse text (6)
+SPEED_LIMIT_KMH = 300.0 # set to avoid rogue points due misread data
+
+# Regex to extract five-decimal floats
+FLOAT5_RE = re.compile(r'(-?\d{1,3}\.\d{5})')
+# Also capture direction letters if present nearby (usually no)
+DIR_RE = re.compile(r'([NnSs])|([EeWw])')
+
+# ---------------- helpers ----------------
+def ensure_output_folder():
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    outdir = os.path.join(desktop, "OCR")
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+def write_gpx_latlon_time(points, out_path):
+    # points: list of (datetime, lat, lon)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        f.write('<gpx version="1.1" creator="DashcamToGPX v30" xmlns="http://www.topografix.com/GPX/1/1">\n')
+        f.write('  <trk><name>Extracted track</name><trkseg>\n')
+        for t, lat, lon in points:
+            timestr = t.isoformat() + "Z" if isinstance(t, datetime) else str(t)
+            f.write(f'    <trkpt lat="{lat:.6f}" lon="{lon:.6f}">\n')
+            f.write(f'      <ele>0.0</ele>\n')
+            f.write(f'      <time>{timestr}</time>\n')
+            f.write('    </trkpt>\n')
+        f.write('  </trkseg></trk>\n</gpx>\n')
+
+def build_map_image_single(lat, lon, size_px=(540,400), zoom=16, marker_size=16):
+    """Return a PIL Image centered on lat,lon with a single red marker."""
+    try:
+        sm = StaticMap(size_px[0], size_px[1], url_template='https://a.tile.openstreetmap.org/{z}/{x}/{y}.png')
+        sm.add_marker(CircleMarker((lon, lat), 'red', marker_size))
+        img = sm.render(zoom=zoom)
+        return img
+    except Exception as e:
+        # fallback: simple placeholder
+        from PIL import Image as PILImage, ImageDraw
+        img = PILImage.new("RGB", size_px, (80,80,80))
+        draw = ImageDraw.Draw(img)
+        draw.text((10,10), f"Map error: {e}", fill=(255,255,255))
+        return img
+
+def preprocess_attempts_for_ocr(crop_bgr):
+    """
+    Return list of PIL images (RGB) to try with Tesseract, ordered by likely success.
+    We keep the ROI exactly as provided; but try resizing, equalization, thresholding variants.
+    """
+    results = []
+    try:
+        # convert to gray to increase readibility
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        return results
+
+    # base small-scale upscale — Garmin font can be small: enlarge
+    h, w = gray.shape
+    scale = 2
+    gray_big = cv2.resize(gray, (w*scale, h*scale), interpolation=cv2.INTER_CUBIC)
+
+    # 1) original enlarged
+    results.append(Image.fromarray(gray_big).convert("RGB"))
+
+    # 2) histogram equalized (improves contrast)
+    eq = cv2.equalizeHist(gray_big)
+    results.append(Image.fromarray(eq).convert("RGB"))
+
+    # 3) median blur + Otsu
+    blur = cv2.medianBlur(eq, 3)
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    results.append(Image.fromarray(otsu).convert("RGB"))
+
+    # 4) adaptive threshold (good for variable lighting)
+    adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY, 11, 2)
+    results.append(Image.fromarray(adapt).convert("RGB"))
+
+    # 5) morphological close to consolidate strokes
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+    morph = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE, kernel)
+    results.append(Image.fromarray(morph).convert("RGB"))
+
+    # 6) inverted versions (text is often light on dark)
+    inv = 255 - morph
+    results.append(Image.fromarray(inv).convert("RGB"))
+
+    # Keep unique images only (avoid duplicates)
+    unique = []
+    seen = set()
+    for im in results:
+        arr = np.array(im)
+        key = arr.tobytes()[:256]  
+        if key not in seen:
+            unique.append(im)
+            seen.add(key)
+    return unique
+
+def extract_coords_from_text(text):
+    """
+    Given OCR text, pull two five-decimal floats and optional direction letters near them.
+    Strategy: find all matches of -?\d{1,3}\.\d{5} and pair first two.
+    If direction letters (N/S/E/W) appear nearby, apply sign accordingly.
+    Returns (lat, lon) or None.
+    """
+    if not text:
+        return None
+    # Normalize common OCR confusions
+    txt = text.replace(',', '.').replace('°', '').replace(' ', '')
+    floats = FLOAT5_RE.findall(txt)
+    if len(floats) < 2:
+        # Try looser: allow 4 or 5 decimals if OCR dropped a digit
+        floats_loose = re.findall(r'(-?\d{1,3}\.\d{4,5})', txt)
+        if len(floats_loose) >= 2:
+            floats = floats_loose[:2]
+        else:
+            return None
+    lat_s, lon_s = floats[0], floats[1]
+    try:
+        lat = float(lat_s); lon = float(lon_s)
+    except:
+        return None
+
+    # detect direction letters near numbers (in original text)
+    # If an 'S' or 's' appears before/after lat numeric substring, make negative.
+    # Simple approach: search for the numeric substring and inspect 2 chars around it.
+    def find_dir_around(numstr, text):
+        idx = text.find(numstr)
+        if idx == -1:
+            return None
+        before = text[max(0, idx-2):idx].upper()
+        after = text[idx+len(numstr):idx+len(numstr)+2].upper()
+        if 'S' in before or 'S' in after:
+            return 'S'
+        if 'N' in before or 'N' in after:
+            return 'N'
+        if 'W' in before or 'W' in after:
+            return 'W'
+        if 'E' in before or 'E' in after:
+            return 'E'
+        return None
+
+    dir_lat = find_dir_around(lat_s, text)
+    dir_lon = find_dir_around(lon_s, text)
+
+    if dir_lat == 'S':
+        lat = -abs(lat)
+    elif dir_lat == 'N':
+        lat = abs(lat)
+    if dir_lon == 'W':
+        lon = -abs(lon)
+    elif dir_lon == 'E':
+        lon = abs(lon)
+
+    return lat, lon
+
+def ocr_try_all(pil_images):
+    """
+    Given a list of PIL images, run tesseract attempts with different PSMs to maximize chance.
+    Returns tuple (lat, lon, raw_text) or None.
+    """
+    for psm in TESS_PSMS:
+        config = f'--psm {psm} {TESS_CONFIG_BASE}'
+        for pil in pil_images:
+            try:
+                txt = pytesseract.image_to_string(pil, config=config)
+            except Exception:
+                txt = ""
+            coords = extract_coords_from_text(txt)
+            if coords:
+                lat, lon = coords
+                return lat, lon, txt
+    return None
+
+# ---------------- GUI + Worker ----------------
+class App:
+    def __init__(self, root):
+        self.root = root
+        root.title(f"DashcamToGPX {VERSION}")
+        root.geometry("1200x760")
+
+        # Top frames
+        top = Frame(root); top.pack(side='top', fill='both', expand=True)
+        bottom = Frame(root, height=260); bottom.pack(side='bottom', fill='x')
+
+        # Left: frame preview
+        left = Frame(top, bg='black', width=640, height=480); left.pack(side='left', fill='both', expand=True)
+        self.frame_label = Label(left)
+        self.frame_label.pack(fill='both', expand=True)
+
+        # Middle: details box (latest analyzed points)
+        mid = Frame(top, width=320); mid.pack(side='left', fill='y')
+        Label(mid, text="Latest analyzed points (time | lat,lon)").pack(anchor='nw', padx=6, pady=(6,0))
+        self.details = scrolledtext.ScrolledText(mid, width=40, height=30, state='disabled')
+        self.details.pack(fill='both', expand=True, padx=6, pady=6)
+
+        # Right: map
+        right = Frame(top, bg='grey', width=540, height=480); right.pack(side='right', fill='both', expand=True)
+        self.map_label = Label(right)
+        self.map_label.pack(fill='both', expand=True)
+
+        # Bottom: controls + log
+        ctrl = Frame(bottom)
+        ctrl.pack(side='left', fill='y', padx=8, pady=6)
+        Button(ctrl, text="Select Video(s) & Start", command=self.select_and_start).pack(pady=(4,8))
+        Label(ctrl, text="Start date/time (YYYY-mm-dd HH:MM:SS):").pack(anchor='w')
+        self.dt_var = StringVar(); self.dt_var.set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        Entry(ctrl, textvariable=self.dt_var, width=22).pack(pady=(2,6))
+        self.use_fname_var = StringVar(value="use")
+        ttk.Radiobutton(ctrl, text="Use date FROM filename (yyyy.mm.dd)", variable=self.use_fname_var, value="use").pack(anchor='w')
+        ttk.Radiobutton(ctrl, text="Manual date/time", variable=self.use_fname_var, value="manual").pack(anchor='w')
+
+        self.progress = ttk.Progressbar(bottom, mode='determinate', length=600)
+        self.progress.pack(side='top', padx=8, pady=(6,4))
+
+        self.log = scrolledtext.ScrolledText(bottom, height=6, state='disabled')
+        self.log.pack(side='left', fill='both', expand=True, padx=6, pady=6)
+
+        # internal images refs to avoid GC
+        self.latest_frame_image = None
+        self.map_image = None
+
+        # output folder
+        self.outdir = ensure_output_folder()
+        self.append_log(f"Output folder: {self.outdir}")
+
+    def append_log(self, txt):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log.configure(state='normal')
+        self.log.insert('1.0', f"[{ts}] {txt}\n")
+        self.log.configure(state='disabled')
+
+    def append_detail(self, txt):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.details.configure(state='normal')
+        self.details.insert('1.0', f"[{ts}] {txt}\n")
+        self.details.configure(state='disabled')
+
+    def select_and_start(self):
+        files = filedialog.askopenfilenames(title="Select videos", filetypes=[("Video files","*.mp4;*.avi;*.mov;*.mkv")])
+        if not files:
+            return
+        # start background worker
+        threading.Thread(target=self.worker, args=(list(files),), daemon=True).start()
+
+    def worker(self, files):
+        total_files = len(files)
+        for fi, path in enumerate(files, start=1):
+            basename = os.path.basename(path)
+            self.root.after(0, lambda p=basename: self.append_log(f"Processing ({fi}/{total_files}): {p}"))
+            # determine start datetime (use filename or manual)
+            use_fname = self.use_fname_var.get() == "use"
+            if use_fname:
+                m = re.search(r"(\d{4}\.\d{2}\.\d{2})", basename)
+                if m:
+                    yyyy, mm, dd = m.group(1).split(".")
+                    try:
+                        start_dt = datetime.strptime(f"{yyyy}-{mm}-{dd} 00:00:00", "%Y-%m-%d %H:%M:%S")
+                    except:
+                        start_dt = datetime.now()
+                else:
+                    try:
+                        start_dt = datetime.strptime(self.dt_var.get().strip(), "%Y-%m-%d %H:%M:%S")
+                    except:
+                        start_dt = datetime.now()
+            else:
+                try:
+                    start_dt = datetime.strptime(self.dt_var.get().strip(), "%Y-%m-%d %H:%M:%S")
+                except:
+                    start_dt = datetime.now()
+
+            # open video
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                self.root.after(0, lambda: self.append_log(f"Cannot open: {basename}"))
+                continue
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            duration_s = int(total_frames / fps) if fps > 0 else 0
+
+            # read first frame to compute ROI pixel coords
+            ret, first_frame = cap.read()
+            if not ret:
+                cap.release()
+                self.root.after(0, lambda: self.append_log(f"Cannot read first frame: {basename}"))
+                continue
+            h, w = first_frame.shape[:2]
+            x1 = int(w * ROI_DEFAULT[0]); x2 = int(w * ROI_DEFAULT[1])
+            y1 = int(h * ROI_DEFAULT[2]); y2 = int(h * ROI_DEFAULT[3])
+
+            raw_points = []
+            # progress bar reset per file
+            self.root.after(0, lambda: self.progress.configure(maximum=duration_s, value=0))
+
+            # process each second
+            frame_shifts = [0, 2, 4, 6, 8]
+            for sec in range(duration_s):
+                offsets = frame_shifts if sec < 60 else [0]
+                found = False
+                for off in offsets:
+                    frame_num = int(max(0, sec * fps + off))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                    ret, frame = cap.read()
+                    if not ret:
+                        continue
+                    # show frame preview (thread-safe)
+                    pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    self.root.after(0, lambda im=pil_frame: self.show_frame(im))
+
+                    crop = frame[y1:y2, x1:x2]
+                    # generate multiple preprocessed images
+                    candidates = preprocess_attempts_for_ocr(crop)
+                    coords_found = None
+                    if candidates:
+                        res = ocr_try_all(candidates)
+                        if res:
+                            lat, lon, rawtxt = res
+                            coords_found = (lat, lon, rawtxt)
+                    # record if found
+                    timestamp = start_dt + timedelta(seconds=sec)
+                    if coords_found:
+                        lat, lon, rawtxt = coords_found
+                        raw_points.append((timestamp, lat, lon))
+                        # update details box (thread-safe)
+                        self.root.after(0, lambda t=timestamp, la=lat, lo=lon: self.append_detail(f"{t.time()} | {la:.5f},{lo:.5f}"))
+                        # update map to show only latest point (thread-safe)
+                        self.root.after(0, lambda la=lat, lo=lon: self.update_map_point(la, lo))
+                        found = True
+                        break
+                    else:
+                        # still append a line showing no coords for this second (PLACEHOLDER ONLY, disabled)
+                        # self.root.after(0, lambda t=timestamp: self.append_detail(f"{t.time()} | ---"))
+                        pass
+                # update per-second progress
+                self.root.after(0, lambda s=sec+1: self.progress.configure(value=s))
+            cap.release()
+
+            if raw_points:
+                # Post-process (smoothing & sanity) - we will reuse simple iron_path style smoothing
+                # For brevity, do minimal processing: remove consecutive duplicates closer than 2 meters
+                filtered = []
+                for p in raw_points:
+                    if not filtered:
+                        filtered.append(p)
+                    else:
+                        prev = filtered[-1]
+                        # simple haversine:
+                        def hav(lat1, lon1, lat2, lon2):
+                            R = 6371000.0
+                            from math import radians, sin, cos, sqrt, atan2
+                            phi1, phi2 = radians(lat1), radians(lat2)
+                            dphi = radians(lat2 - lat1)
+                            dlambda = radians(lon2 - lon1)
+                            a = sin(dphi/2.0)**2 + cos(phi1)*cos(phi2)*sin(dlambda/2.0)**2
+                            return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+                        d = hav(prev[1], prev[2], p[1], p[2])
+                        if d >= 2.0:
+                            filtered.append(p)
+                # write GPX to Desktop/OCR
+                outname = os.path.splitext(basename)[0] + "_extracted.gpx"
+                outpath = os.path.join(self.outdir, outname)
+                write_gpx_latlon_time(filtered, outpath)
+                self.root.after(0, lambda p=outpath: self.append_log(f"GPX written: {p}"))
+            else:
+                self.root.after(0, lambda: self.append_log(f"No coordinates found for {basename}"))
+
+            # small pause between files
+            time.sleep(0.2)
+
+        self.root.after(0, lambda: self.append_log("All files processed."))
+
+    # GUI helpers (must run in main thread)
+    def show_frame(self, pil_image):
+        # get original video dimensions (only once)
+        if not hasattr(self, "video_aspect"):
+            self.video_aspect = pil_image.width / pil_image.height
+    
+        # choose height of preview
+        preview_height = 480
+        preview_width = int(preview_height * self.video_aspect)
+    
+        # resize with correct aspect ratio
+        img = pil_image.copy().resize((preview_width, preview_height), Image.LANCZOS)
+    
+        # update tkinter image
+        self.latest_frame_image = ImageTk.PhotoImage(img)
+        self.frame_label.config(image=self.latest_frame_image)
+        self.frame_label.image = self.latest_frame_image
+
+    def update_map_point(self, lat, lon):
+        # create single-point map and show it
+        img = build_map_image_single(lat, lon, size_px=(540,480), zoom=16, marker_size=14)
+        self.map_image = ImageTk.PhotoImage(img)
+        self.map_label.config(image=self.map_image)
+        self.map_label.image = self.map_image
+
+if __name__ == "__main__":
+    root = Tk()
+    app = App(root)
+    root.mainloop()
